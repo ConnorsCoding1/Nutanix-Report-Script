@@ -1,0 +1,324 @@
+import json
+import requests
+import urllib3
+import time
+from openpyxl import Workbook
+from base64 import b64encode
+from openpyxl.utils import get_column_letter
+import http.client
+import ssl
+import base64
+
+ # urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning) This was used in testing
+
+def payload(url, user, password):
+    request_url = url
+    username = user
+    password = password
+    encoded_credentials = b64encode(bytes(f'{username}:{password}',
+    encoding='ascii')).decode('ascii')
+    auth_header = f'Basic {encoded_credentials}'
+
+    # payload = '{"kind":"vm"}'
+    payload = '{"kind":"vm","length":500}'
+
+    headers = {'Accept': 'application/json', 'Content-Type': 'application/json',
+    'Authorization': f'{auth_header}', 'cache-control': 'no-cache'}
+
+    response = requests.request('post', request_url, data=payload, headers=headers) # Verify = false was in here
+    print(response.status_code)
+    # Is diary cut off?
+    diary = response.json()
+    return diary
+
+def excelWork(diary, user, password, clusterM, connM, clusterS, connS, saveLocation):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Summary"
+    ws.sheet_state = "visible"      # tried with or without doesnt matter
+
+    totalVMs = 0
+    onlineVMs = 0
+    offlineVMs = 0
+    totalCPUs = 0
+    avgCPUsPerVM = 0
+    totalRAM = {"value": 0, "unit": " MB"}
+    # avgRamPerVM = {"value": 0, "unit": " MB"}
+    # # TOTAL POSSIBLE TO FILL, NOT USED
+    totalStorage = {"value": 0, "unit": " MB"}
+    # avgStoragePerVM = {"value": 0, "unit": " MB"}
+
+
+    # Pop out a new sheet each time
+    for log in diary["entities"]:
+        try:
+            totalCPUs += log["spec"]["resources"]["num_sockets"] * log["spec"]["resources"]["num_vcpus_per_socket"] * log["spec"]["resources"]["num_threads_per_core"]
+            totalRAM["value"] += log["spec"]["resources"]["memory_size_mib"]
+    
+            for disk in log["spec"]["resources"].get("disk_list", []):
+                if disk.get("disk_size_mib") != None:
+                    totalStorage["value"] += disk.get("disk_size_mib")
+
+            # Total VMs
+            vm = log["spec"]["name"] 
+            if vm != None:
+                totalVMs += 1
+            #power
+            power = log["status"]["resources"]["power_state"]
+            # print(power)
+            if power == "ON":
+                onlineVMs += 1
+            if power == "OFF":          # Could do ELSE but this is better for edge cases
+                offlineVMs += 1
+
+        except Exception as e:
+            print("OOPS")
+            print(e)
+
+    # Conversions (mb, gb, tb)  !Everything starts at mb! Everything must be gb or higher
+    def totalConversions(totalConvertable):
+        if totalConvertable["value"] > 0:
+            totalConvertable["value"] = totalConvertable["value"]/1024           # assuming its 1024 and not 1000
+            totalConvertable["unit"] = " GB"
+            # Conversions to TB
+            if totalConvertable["value"] > 1023:
+                totalConvertable["value"] = totalConvertable["value"]/1024
+                totalConvertable["unit"] = " TB"
+
+    totalConversions(totalRAM)
+    totalConversions(totalStorage)
+
+
+    def avgConversions(totConvertable):
+        avgConvertable = {"value": 0, "unit": " MB"}
+        if isinstance(totConvertable, dict):        # If its a dictionary (totalRAM and totalStorage)
+            
+            if totConvertable["value"] > 0:
+                avgConvertable["unit"] = totConvertable["unit"]
+                avgConvertable["value"] = totConvertable["value"]/totalVMs
+                if totConvertable["unit"] == " TB":
+                    if avgConvertable["value"] > 1:
+                        print("WOW 1TB RAM PER VM?!?!")
+                        avgConvertable["unit"] = " TB"
+                    else:
+                        avgConvertable["value"] = avgConvertable["value"] * 1024 # It was too small, go back to gigs
+                        avgConvertable["unit"] = " GB"
+        else:
+            if totConvertable > 0:       # Work on
+                avgConvertable = totConvertable/totalVMs
+        return avgConvertable
+
+    if totalVMs > 0:
+        avgCPUsPerVM = avgConversions(totalCPUs)
+        avgRamPerVM = avgConversions(totalRAM)
+        avgStoragePerVM = avgConversions(totalStorage)
+
+    # Save them to the selected spreadsheet, spreadsheet must be closed
+    ws.append(["totalVMs", "onlineVMs", "offlineVMs", "Total CPUs", "Avg CPUs Per VM", "Total Ram", "Avg Ram Per VM", "Total Provisioned Storage", "Avg Storage Per VM"])
+    ws.append([
+        str(totalVMs), str(onlineVMs), str(offlineVMs), str(totalCPUs), str(round(avgCPUsPerVM, 2)), 
+        str(round(totalRAM["value"], 2)) + totalRAM["unit"], 
+        str(round(avgRamPerVM["value"], 2)) + avgRamPerVM["unit"], 
+        str(round(totalStorage["value"], 2)) + totalStorage["unit"], 
+        str(round(avgStoragePerVM["value"], 2)) + avgStoragePerVM["unit"]
+        ])
+    ws.append([""])     # Break cells
+    ws.append([""])     # Break cells
+
+    ws.append(["Top 5", "Top CPU Count", "Top RAM Provisioned", "Top Storage Provisioned"])
+    # Make methods so you can call stuff when needed
+    ws.append([""])     # Row to be overwritten (6)
+    ws.append([""])     # Row to be overwritten (7)  
+    ws.append([""])     # Row to be overwritten (8)
+    ws.append([""])     # Row to be overwritten (9)
+    ws.append([""])     # Row to be overwritten (10)
+
+    ws.append([""])     # Break cells
+    ws.append([""])     # Break cells
+
+    ws.append(["VM", "VM CLUSTER", "Status", "CPUs", "CPU Usage", "RAM", "RAM Usage", "Storage", "Total Data Written", "IP Address"])
+    
+    logList = []
+    for log in diary["entities"]:
+        logList.append(log)
+        logList.sort(key=lambda item: (item["spec"]["cluster_reference"]["name"], item["spec"]["name"].casefold()))
+    # print(logList)
+    # AFTER SORTING by cluster then alphabetical
+
+    #  NEXT CALL_______________________________________________________________________________________________________________________________________
+    print("hi 2rd CALL?!?!") # THIRD
+    ssl._create_default_https_context = ssl._create_unverified_context
+    
+    ram = {"value": 0, "unit": " MB"}
+    storage = {"value": 0, "unit": " MB"}
+    # ppm = parts per million 
+    pcPart = "hypervisor_cpu_usage_ppm,memory_usage_ppm,controller.storage_tier.ssd.usage_bytes"
+
+    # CHANGE TIME TO YOUR LIKING
+    # Microseconds to seconds!!!
+    now = int(time.time() * 1_000_000)
+    intervalInSecs = 60
+    start = now - (24 * 60 * 60 * 1_000_000)
+
+    # The FATHER of iteration betweeen all logs
+    for log in logList:
+        vm = log["spec"]["name"] # Total VMs?           Currently it just adds from how entities grabs it
+        vmCluster = log["spec"]["cluster_reference"]["name"]        # Important for 2nd api call
+        status = log["status"]["resources"]["power_state"]
+        cpus = log["spec"]["resources"]["num_sockets"] * log["spec"]["resources"]["num_vcpus_per_socket"] * log["spec"]["resources"]["num_threads_per_core"]
+        ram["value"] = log["spec"]["resources"]["memory_size_mib"]
+      # Will storage need to reset?
+        for disk in log["spec"]["resources"].get("disk_list", []):
+            if disk.get("disk_size_mib") != None:
+                storage["value"] += disk.get("disk_size_mib")
+        try:
+            ipAdress = log["status"]["resources"]["nic_list"][0]["ip_endpoint_list"][0]["ip"]
+        except Exception as e:
+            ipAdress = None
+        uptime = 0      # bro...
+
+        totalConversions(ram)
+        totalConversions(storage)
+
+        # You'll need to deal with each cluster, lucky for you we already sort by that
+        if (vmCluster == clusterM):
+            conn = http.client.HTTPSConnection(connM)
+        else:
+            conn = http.client.HTTPSConnection(connS)
+
+        auth = base64.b64encode(f"{user}:{password}".encode()).decode()
+        # USE PASSWORDS
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            'Authorization': f"Basic {auth}"
+        }
+        # Force vmID till approval from Manager
+        vmID = log["metadata"]["uuid"]
+        timeString = "&startTimeInUsecs=" + str(start) + "&endTimeInUsecs=" + str(now) + "&intervalInSecs=" + str(intervalInSecs)
+        path = "/PrismGateway/services/rest/v1/vms/" + vmID + "/stats/?metrics=" + pcPart + timeString
+        
+        # PROOF WE ARE BEING SAFE
+        conn.request("GET", path, headers=headers)
+
+        res = conn.getresponse()
+        data = res.read()
+        usages = json.loads(data.decode("utf-8"))
+        # print(usages["statsSpecificResponses"][0]["values"])        # CPU USAGE
+        # print(usages["statsSpecificResponses"][1]["values"])        # MEMORY USAGE
+        # print(usages["statsSpecificResponses"][2]["values"])        # STORAGE USAGE
+        def numberCalc(numbers, i):
+            try:
+                numbers = usages["statsSpecificResponses"][i]["values"]
+                amount = len(numbers)
+                totalNumbers = 0
+                for number in numbers:
+                    totalNumbers += number
+                avg = (totalNumbers/amount)
+                usage = avg/10000           # ppm
+            except Exception as e:
+                usage = 0
+            return usage
+        cpuNumbers = usages["statsSpecificResponses"][0]["values"]
+        memNumbers = usages["statsSpecificResponses"][1]["values"]
+        cpuUsage = numberCalc(cpuNumbers, 0)
+        memUsage = numberCalc(memNumbers, 1)
+        
+        storageNumbers = usages["statsSpecificResponses"][2]["values"][-1]
+        print(storageNumbers)
+        storageUsage = storageNumbers / (1024**3)
+
+        if storageUsage > 1023:        # Can we convert to TB?
+            storageUsage = round(storageUsage/1024, 2)
+            storageUsage = str(storageUsage) + " TB"
+        else: 
+            storageUsage = round(storageUsage, 2)
+            storageUsage = str(storageUsage) + " GB"      # No :()
+        
+        ws.append([vm, vmCluster, status, str(cpus), str(round(cpuUsage, 2)) + " %", str(round(ram["value"], 2)) + ram["unit"], str(round(memUsage, 2)) + " %", str(round(storage["value"], 2)) + storage["unit"], storageUsage, ipAdress])
+        storage["value"] = 0
+
+    # Top 5 sorting and stuff       ex: ws.cell(row=5, column=2, value="")
+    ws.cell(row=6, column=1, value="1")
+    ws.cell(row=7, column=1, value="2")
+    ws.cell(row=8, column=1, value="3")
+    ws.cell(row=9, column=1, value="4")
+    ws.cell(row=10, column=1, value="5")
+
+    # Top CPU Count 
+    logList.sort(key=lambda item: item["spec"]["resources"]["num_sockets"]* item["spec"]["resources"]["num_vcpus_per_socket"] * item["spec"]["resources"]["num_threads_per_core"], reverse=True)
+    i = 5
+    for log in logList[:5]:
+        vm = log["spec"]["name"]
+        i +=1 
+        ws.cell(row=i, column=2, value=vm + " - " + str(log["spec"]["resources"]["num_sockets"] * log["spec"]["resources"]["num_vcpus_per_socket"] * log["spec"]["resources"]["num_threads_per_core"]))
+
+    # Top RAM Provisioned
+    topRAMTag = " GB"
+    logList.sort(key=lambda item: item["spec"]["resources"]["memory_size_mib"], reverse=True)
+    # print(logList)
+    i = 5
+    for log in logList[:5]:
+        vm = log["spec"]["name"]
+        i +=1 
+        ram = log["spec"]["resources"]["memory_size_mib"]/1024 # Convert to GB
+        if ram > 1024:
+            ram = ram/1024
+            topRAMTag = " TB"
+        ws.cell(row=i, column=3, value=vm + " - " + str(ram) + topRAMTag)
+
+    # Top Storage Provisioned
+    storageList = []
+    for log in logList:
+        vmName = log["spec"]["name"]
+        total = 0
+        for disk in log["spec"]["resources"].get("disk_list", []):
+            if disk.get("disk_size_mib") != None:
+                total += disk.get("disk_size_mib")
+        storageList.append((vmName, total))
+
+    storageList.sort(key=lambda x: x[1], reverse=True)
+
+    i = 5
+    for vmName, storage in storageList[:5]:
+        i +=1 
+        value = storage/1024 # convert to gigs
+        topStorageTag = " GB"
+        if value > 1024:
+            value = value/1024 # convert to terrabytes
+            topStorageTag = " TB"
+        ws.cell(row=i, column=4, value=vmName + " - " + str(round(value, 2)) + topStorageTag)
+
+    # Loop to correctly size each category
+    for column in ws.columns:
+        width = max(len(str(cell.value)) if cell.value else 0 for cell in column)
+        ws.column_dimensions[get_column_letter(column[0].column)].width = width + 2
+
+    wb.save(saveLocation)
+
+def main(): 
+    # Nutanix
+    print("enter url")
+    url = (input())
+    # Login
+    print("enter user")
+    user = (input())
+    print("enter password/secretkey")
+    password = (input())
+    # Input for redacted stuff
+    print("enter cluster in main center")
+    clusterM = (input())
+    print("enter that clusters http connection")
+    connM = (input())
+    print("enter cluster in side center")
+    clusterS = (input())
+    print("enter that clusters http connection")
+    connS = (input())
+    print("where do you wish to save?")
+    saveLocation = (input())
+
+    diary = payload(url, user, password)
+    excelWork(diary, user, password, clusterM, connM, clusterS, connS, saveLocation)
+
+# Start it off
+main()
